@@ -3,6 +3,7 @@ import torch
 from torch import nn
 from torch.autograd import Variable
 from time import time
+import random
 
 class GaussianSplat(nn.Module):
     #
@@ -93,16 +94,16 @@ class NodeEncoder(nn.Module):
 
     def __init__(self, hidden_size):
         super(NodeEncoder, self).__init__()
-        self.linear1 = nn.Linear(hidden_size * 3 + 3, hidden_size * 2)
+        self.linear1 = nn.Linear(hidden_size * 2 + 3, hidden_size * 2)
         self.relu1 = nn.ReLU()
         self.linear2 = nn.Linear(hidden_size * 2, hidden_size)
 
         
-    def forward(self, self_feat, leaf_left, leaf_right, axis):
+    def forward(self, leaf_left, leaf_right, axis):
         axis_index = int(axis.item()) if torch.is_tensor(axis) else int(axis)
-        axis_vec = torch.zeros(1, 3, device=self_feat.device)
+        axis_vec = torch.zeros(1, 3, device=leaf_left.device)
         axis_vec[0, axis_index] = 1.0
-        merged = torch.cat([self_feat, leaf_left, leaf_right, axis_vec], dim=1)
+        merged = torch.cat([leaf_left, leaf_right, axis_vec], dim=1)
         output = self.linear1(merged)
         output = self.relu1(output)
         return self.linear2(output)
@@ -123,8 +124,8 @@ class ROctEncoder(nn.Module):
     def LeafEncoder(self, node):
         return self.leaf_encoder(node)
     
-    def NodeEncoder(self, self_feat, node1, node2, axis):
-        return self.node_encoder(self_feat, node1, node2, axis)
+    def NodeEncoder(self, node1, node2, axis):
+        return self.node_encoder(node1, node2, axis)
     
     def sampleEncoder(self, node):
         return self.sample_encoder(node)
@@ -135,11 +136,10 @@ def encode_structure(tree, encoder):
             return None
         if node.is_leaf():
             return encoder.LeafEncoder(node)
-        self_feat = encoder.LeafEncoder(node)
         child1 = encode_node(node.left)
         child2 = encode_node(node.right)
-        axis = torch.tensor([node.axis], dtype=torch.long, device=self_feat.device)
-        return encoder.NodeEncoder(self_feat, child1, child2, axis)
+        axis = torch.tensor([node.axis], dtype=torch.long, device=child1.device)
+        return encoder.NodeEncoder(child1, child2, axis)
 
     encoding = encode_node(tree.root)
     return encoder.sampleEncoder(encoding)
@@ -165,16 +165,16 @@ class SampleDecoder(nn.Module):
 class NodeDecoder(nn.Module):
     def __init__(self, hidden_size):
         super(NodeDecoder, self).__init__()
-        self.linear1 = nn.Linear(hidden_size, hidden_size * 3)
+        self.linear1 = nn.Linear(hidden_size, hidden_size * 2)
         self.relu = nn.ReLU()
-        self.linear2 = nn.Linear(hidden_size * 3,  hidden_size * 3)
+        self.linear2 = nn.Linear(hidden_size * 2,  hidden_size * 2)
         
 
     def forward(self, parent_feature):
         vector = self.linear1(parent_feature)
         vector = self.relu(vector)
         vector = self.linear2(vector)
-        return vector.chunk(3, dim=1)
+        return vector.chunk(2, dim=1)
 
 class leafDecoder(nn.Module):
     
@@ -184,12 +184,14 @@ class leafDecoder(nn.Module):
         self.relu = nn.ReLU()
         self.point_count = point_count
         self.linear2 = nn.Linear(hidden_size, feature_size * point_count)
+        self.scores_head = nn.Linear(hidden_size, point_count)
 
     def forward(self, leaf_input):
         input = self.linear1(leaf_input)
         input = self.relu(input)
         feat = self.linear2(input)
-        return feat
+        score = self.scores_head(input)
+        return feat, score
 
 class ROctDecoder(nn.Module):
     def __init__(self, config):
@@ -212,7 +214,7 @@ class ROctDecoder(nn.Module):
         return self.sample_decoder(node)
 
  
-    def leafLossEstimator(self, leaf_feature, gt_leaf_feature):
+    def leafLossEstimator(self, leaf_feature, gt_leaf_feature, pred_mask=None):
         if gt_leaf_feature.dim() == 1:
             gt_leaf_feature = gt_leaf_feature.unsqueeze(0)
         if leaf_feature.dim() == 1:
@@ -220,6 +222,11 @@ class ROctDecoder(nn.Module):
         feat_size = gt_leaf_feature.size(1)
         pred = leaf_feature.view(-1, self.leaf_decoder.point_count, feat_size)
         gt = gt_leaf_feature
+        mask = pred_mask
+        if mask is not None:
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+            mask = mask.to(dtype=pred.dtype, device=pred.device).clamp_min(1e-6)
 
         if self.loss_weights is not None:
             if self._loss_weights_tensor is None or self._loss_weights_tensor.numel() != feat_size:
@@ -235,8 +242,14 @@ class ROctDecoder(nn.Module):
         pred_exp = pred.unsqueeze(2)  # (B, K, 1, C)
         gt_exp = gt.unsqueeze(0).unsqueeze(1)  # (1, 1, N, C)
         dists = torch.sum((pred_exp - gt_exp) ** 2, dim=-1)  # (B, K, N)
-        loss1 = torch.min(dists, dim=2)[0].mean()
-        loss2 = torch.min(dists, dim=1)[0].mean()
+        pred_to_gt = torch.min(dists, dim=2)[0]
+        if mask is None:
+            loss1 = pred_to_gt.mean()
+            loss2 = torch.min(dists, dim=1)[0].mean()
+        else:
+            loss1 = (pred_to_gt * mask).sum() / mask.sum().clamp_min(1.0)
+            active_dists = dists / mask.unsqueeze(2)
+            loss2 = torch.min(active_dists, dim=1)[0].mean()
         loss = loss1 + loss2
         return loss.unsqueeze(0)
 
@@ -256,10 +269,23 @@ class ROctDecoder(nn.Module):
         return v.mul_(0)
 
 
-def decode_structure(feature, tree, decoder, reduction="sum"):
+def decode_structure(feature, tree, decoder, keep_list=None, temperature=0.5, reduction="sum"):
     def decode_node_leaf(node, feat):
         if node.is_leaf():
-            fea = decoder.leafDecoder(feat)
+            fea, score = decoder.leafDecoder(feat)
+            valid_keep = keep_list
+            if valid_keep is None:
+                valid_keep = [
+                    max(1, decoder.leaf_decoder.point_count // 4),
+                    max(1, decoder.leaf_decoder.point_count // 2),
+                    decoder.leaf_decoder.point_count,
+                ]
+            valid_keep = [k for k in valid_keep if 1 <= k <= decoder.leaf_decoder.point_count]
+            if not valid_keep:
+                valid_keep = [decoder.leaf_decoder.point_count]
+            k = random.choice(valid_keep)
+            threshold = torch.topk(score, k=k, dim=1).values[:, -1:]  # (B, 1)
+            mask = torch.sigmoid((score - threshold) / temperature)
             gt = getattr(node, "points_tensor", None)
             if gt is None:
                 gt = torch.as_tensor(node.points, dtype=torch.float32, device=fea.device)
@@ -268,10 +294,11 @@ def decode_structure(feature, tree, decoder, reduction="sum"):
                 node.points_tensor = gt
             else:
                 gt = gt.to(fea.device)
-            recon_loss = decoder.leafLossEstimator(fea, gt)
-            leaf_count = torch.ones_like(recon_loss)
-            return recon_loss, leaf_count
-        _self_feat, child1, child2 = decoder.NodeDecoder(feat)
+            recon_loss_all = decoder.leafLossEstimator(fea, gt)
+            recon_loss_k = decoder.leafLossEstimator(fea, gt, pred_mask=mask)
+            leaf_count = torch.ones_like(recon_loss_all)
+            return (recon_loss_all + recon_loss_k) / 2.0, leaf_count
+        child1, child2 = decoder.NodeDecoder(feat)
 
         child_loss1, child_count1 = decode_node_leaf(node.left, child1)
         child_loss2, child_count2 = decode_node_leaf(node.right, child2)

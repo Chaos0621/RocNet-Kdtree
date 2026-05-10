@@ -8,7 +8,7 @@ from ROctNetmodel_32_kdtree import ROctEncoder, ROctDecoder, encode_structure, d
 
 class KDNode:
     def __init__(self, points, axis, left=None, right=None):
-        # points with the same value are stored together
+        # Internal nodes keep structure only; leaves keep gaussian points.
         self.points = points
         self.axis = axis
         self.left = left
@@ -37,42 +37,14 @@ def build_kdtree(points, depth=0, split_dims=3, max_leaf_size=None):
 
     axis = depth % split_dims
 
-    points = sorted(points, key=lambda x: x[axis])
+    points = sorted(points, key=lambda x: (x[axis], _point_key(x)))
 
     mid = len(points)//2
-    pivot = points[mid]
-
-    def same_point(a, b):
-        if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
-            return np.array_equal(a, b)
-        return a == b
-
-    left_points = []
-    right_points = []
-    same_points = []
-
-    pivot_key = _point_key(pivot)
-
-    for p in points:
-        if same_point(p, pivot):
-            same_points.append(p)
-            continue
-        if p[axis] < pivot[axis]:
-            left_points.append(p)
-        elif p[axis] > pivot[axis]:
-            right_points.append(p)
-        else:
-            if _point_key(p) < pivot_key:
-                left_points.append(p)
-            else:
-                right_points.append(p)
-
-    if len(left_points) == 0 or len(right_points) == 0:
-        # avoid single-child internal nodes
-        return KDNode(points=same_points + left_points + right_points, axis=axis)
+    left_points = points[:mid]
+    right_points = points[mid:]
 
     return KDNode(
-        points=same_points,
+        points=[],
         axis=axis,
         left=build_kdtree(left_points, depth+1, split_dims=split_dims, max_leaf_size=max_leaf_size),
         right=build_kdtree(right_points, depth+1, split_dims=split_dims, max_leaf_size=max_leaf_size)
@@ -258,6 +230,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ply", type=str, default="/data/23010572/roc/RocNet/hotdog/hotdog/gaussians_iter30000.ply", help="Hotdog point_cloud.ply path")
     parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--keep-list", type=int, nargs="+", default=None)
+    parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--leaf-point-count", type=int, default=16)
     parser.add_argument("--hidden-size", type=int, default=128)
@@ -353,7 +327,14 @@ if __name__ == "__main__":
 
     for step in range(args.steps + 1):
         root_code = encode_structure(tree, encoder)
-        recon_loss = decode_structure(root_code, tree, decoder, reduction=args.loss_reduction).mean()
+        recon_loss = decode_structure(
+            root_code,
+            tree,
+            decoder,
+            keep_list=args.keep_list,
+            temperature=args.temperature,
+            reduction=args.loss_reduction,
+        ).mean()
 
         optim.zero_grad()
         recon_loss.backward()
@@ -367,7 +348,8 @@ if __name__ == "__main__":
 
         if step % 5 == 0:
             print(f"Step {step:03d} recon_loss={recon_loss.item():.6f}")
-        writer.add_scalar("loss/train", recon_loss.item(), step)
+        if step % 10 == 0:
+            writer.add_scalar("loss/train", recon_loss.item(), step)
         if  step % 400 == 0 and step > 0:
             checkpoint_name = os.path.splitext(os.path.basename(args.save))[0]
             checkpoint_ext = os.path.splitext(os.path.basename(args.save))[1] or ".pt"
@@ -396,16 +378,14 @@ if __name__ == "__main__":
 
     def decode_points(node, feature):
         if node.is_leaf():
-            out = decoder.leafDecoder(feature).detach().cpu().numpy().squeeze()
+            out, _score = decoder.leafDecoder(feature)
+            out = out.detach().cpu().numpy().squeeze()
             pts = out.reshape(SimpleConfig.leaf_point_count, SimpleConfig.feature_size)
             target_n = len(node.points)
             pts = pts[:target_n]
             return [tuple(p.tolist()) for p in pts]
-        self_feat, left_feat, right_feat = decoder.NodeDecoder(feature)
-        out = decoder.leafDecoder(self_feat).detach().cpu().numpy().squeeze()
-        pts = out.reshape(SimpleConfig.leaf_point_count, SimpleConfig.feature_size)
-        pts = [tuple(p.tolist()) for p in pts]
-        pts.extend(decode_points(node.left, left_feat))
+        left_feat, right_feat = decoder.NodeDecoder(feature)
+        pts = decode_points(node.left, left_feat)
         pts.extend(decode_points(node.right, right_feat))
         return pts
 
@@ -423,10 +403,11 @@ if __name__ == "__main__":
 
         def eval_leaf_errors(node, feat):
             if node.is_leaf():
-                pred = decoder.leafDecoder(feat).view(SimpleConfig.leaf_point_count, SimpleConfig.feature_size)
+                pred, _score = decoder.leafDecoder(feat)
+                pred = pred.view(SimpleConfig.leaf_point_count, SimpleConfig.feature_size)
                 gt = torch.tensor(node.points, dtype=pred.dtype, device=pred.device)
                 return chamfer_loss(pred, gt)
-            _self_feat, left_feat, right_feat = decoder.NodeDecoder(feat)
+            left_feat, right_feat = decoder.NodeDecoder(feat)
             return eval_leaf_errors(node.left, left_feat) + eval_leaf_errors(node.right, right_feat)
 
         total_chamfer = eval_leaf_errors(tree.root, root_feature)
